@@ -5,6 +5,7 @@
 #else
 #include <QtGui>
 #endif
+#include <QDirIterator>
 
 #include <jansson.h>
 
@@ -19,32 +20,20 @@
 #include "download-repo-dialog.h"
 
 namespace {
-
-QString buildMoreInfo(ServerRepo& repo)
-{
-    json_t *object = NULL;
-    char *info = NULL;
-
-    object = json_object();
-    json_object_set_new(object, "is_readonly", json_integer(repo.readonly));
-
-    info = json_dumps(object, 0);
-    QString ret = QString::fromUtf8(info);
-    json_decref (object);
-    free (info);
-    return ret;
+bool isNonEmptyDirectory(const QString &dirpath) {
+    QFileInfo dir(dirpath);
+    return dir.isDir() && dir.isReadable() &&
+           QDirIterator(dirpath, QDir::AllEntries | QDir::NoDotAndDotDot,
+                        QDirIterator::Subdirectories).hasNext();
 }
-
-
-} // namespace
+} // anonymous namespace
 
 DownloadRepoDialog::DownloadRepoDialog(const Account& account,
                                        const ServerRepo& repo,
                                        QWidget *parent)
     : QDialog(parent),
       repo_(repo),
-      account_(account),
-      mode_(CREATE_NEW_FOLDER)
+      account_(account)
 {
     setupUi(this);
     if (!repo.isSubfolder())
@@ -78,60 +67,10 @@ DownloadRepoDialog::DownloadRepoDialog(const Account& account,
     setMinimumHeight(height);
     setMaximumHeight(height);
 
-    saved_create_new_path_ = seafApplet->configurator()->worktreeDir();
-
-    updateSyncMode();
-
-    connect(mSwitchModeHint, SIGNAL(linkActivated(const QString&)),
-            this, SLOT(switchMode()));
+    setDirectoryText(QDir(seafApplet->configurator()->worktreeDir()).absoluteFilePath(repo.name));
 
     connect(mChooseDirBtn, SIGNAL(clicked()), this, SLOT(chooseDirAction()));
     connect(mOkBtn, SIGNAL(clicked()), this, SLOT(onOkBtnClicked()));
-}
-
-void DownloadRepoDialog::switchMode()
-{
-    if (mode_ == CREATE_NEW_FOLDER) {
-        mode_ = MERGE_WITH_EXISTING_FOLDER;
-    } else {
-        mode_ = CREATE_NEW_FOLDER;
-    }
-
-    updateSyncMode();
-}
-
-void DownloadRepoDialog::updateSyncMode()
-{
-    QString switch_hint_text;
-    QString op_text;
-    const QString link_template = "<a style=\"color:#FF9A2A\" href=\"#\">%1</a>";
-
-    mDirectory->clear();
-
-    QString OR = tr("or");
-    if (mode_ == CREATE_NEW_FOLDER) {
-        QString link = link_template.arg(tr("sync with an existing folder"));
-        switch_hint_text = QString("%1 %2").arg(OR).arg(link);
-
-        op_text = tr("Create a new sync folder at:");
-
-        if (!saved_create_new_path_.isNull()) {
-            setDirectoryText(saved_create_new_path_);
-        }
-
-    } else {
-        QString link = link_template.arg(tr("create a new sync folder"));
-        switch_hint_text = QString("%1 %2").arg(OR).arg(link);
-
-        op_text = tr("Sync with this existing folder:");
-
-        if (!saved_merge_existing_path_.isNull()) {
-            setDirectoryText(saved_merge_existing_path_);
-        }
-    }
-
-    mOperationText->setText(op_text);
-    mSwitchModeHint->setText(switch_hint_text);
 }
 
 void DownloadRepoDialog::setDirectoryText(const QString& path)
@@ -142,18 +81,12 @@ void DownloadRepoDialog::setDirectoryText(const QString& path)
     }
 
     mDirectory->setText(text);
-
-    if (mode_ == CREATE_NEW_FOLDER) {
-        saved_create_new_path_ = text;
-    } else {
-        saved_merge_existing_path_ = text;
-    }
 }
 
 void DownloadRepoDialog::chooseDirAction()
 {
     const QString &wt = seafApplet->configurator()->worktreeDir();
-    QString dir = QFileDialog::getExistingDirectory(this, tr("Please choose a directory"),
+    QString dir = QFileDialog::getExistingDirectory(this, tr("Please choose an existing directory, or create a new one"),
                                                     wt.toUtf8().data(),
                                                     QFileDialog::ShowDirsOnly
                                                     | QFileDialog::DontResolveSymlinks);
@@ -180,7 +113,7 @@ void DownloadRepoDialog::onOkBtnClicked()
 
 bool DownloadRepoDialog::validateInputs()
 {
-    QString local_dir, password;
+    QString password;
     setDirectoryText(mDirectory->text().trimmed());
     if (mDirectory->text().isEmpty()) {
         QMessageBox::warning(this, getBrand(),
@@ -188,12 +121,16 @@ bool DownloadRepoDialog::validateInputs()
                              QMessageBox::Ok);
         return false;
     }
-    QDir dir(mDirectory->text());
-    if (!dir.exists()) {
-        QMessageBox::warning(this, getBrand(),
-                             tr("The folder does not exist"),
-                             QMessageBox::Ok);
-        return false;
+    sync_with_existing_ = false;
+    // exist and is non-empty?
+    if (isNonEmptyDirectory(mDirectory->text())) {
+        sync_with_existing_ = true;
+        int ret = QMessageBox::question(
+            this, getBrand(), tr("Synchronize with the existing folder %1?")
+                                  .arg(QDir(mDirectory->text()).dirName()),
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+        if (ret & QMessageBox::No)
+          return false;
     }
     if (repo_.encrypted) {
         mPassword->setText(mPassword->text().trimmed());
@@ -206,7 +143,6 @@ bool DownloadRepoDialog::validateInputs()
     }
 
     password = mPassword->text();
-    local_dir = mDirectory->text();
     return true;
 }
 
@@ -222,10 +158,28 @@ void DownloadRepoDialog::onDownloadRepoRequestSuccess(const RepoDownloadInfo& in
 {
     QString worktree = mDirectory->text();
     QString password = repo_.encrypted ? mPassword->text() : QString();
-    int ret;
+    int ret = 0;
     QString error;
 
-    if (mode_ == MERGE_WITH_EXISTING_FOLDER) {
+    // create if not a sync with existing
+    if (!sync_with_existing_) {
+        QDir dir(worktree);
+        ret = dir.mkpath(".") ? 0 : -1;
+        if (ret < 0) {
+            error = tr("unable to create directroy %1").arg(dir.dirName());
+        }
+    }
+
+    // not writable ?
+    if (!ret) {
+        QFileInfo dir(worktree);
+        ret = dir.isWritable() ? 0 : -1;
+        if (ret < 0) {
+            error = tr("unable to write directroy %1").arg(dir.fileName());
+        }
+    }
+
+    if (!ret) {
         ret = seafApplet->rpcClient()->cloneRepo(info.repo_id, info.repo_version,
                                                  info.relay_id,
                                                  repo_.name, worktree,
@@ -235,16 +189,6 @@ void DownloadRepoDialog::onDownloadRepoRequestSuccess(const RepoDownloadInfo& in
                                                  info.random_key, info.enc_version,
                                                  info.more_info,
                                                  &error);
-    } else {
-        ret = seafApplet->rpcClient()->downloadRepo(info.repo_id, info.repo_version,
-                                                    info.relay_id,
-                                                    repo_.name, worktree,
-                                                    info.token, password,
-                                                    info.magic, info.relay_addr,
-                                                    info.relay_port, info.email,
-                                                    info.random_key, info.enc_version,
-                                                    info.more_info,
-                                                    &error);
     }
 
     if (ret < 0) {
@@ -268,7 +212,5 @@ void DownloadRepoDialog::onDownloadRepoRequestFailed(const ApiError& error)
 }
 
 void DownloadRepoDialog::setMergeWithExisting(const QString& localPath) {
-    mode_ = MERGE_WITH_EXISTING_FOLDER;
-    updateSyncMode();
-    mDirectory->setText(localPath);
+    setDirectoryText(localPath);
 }
