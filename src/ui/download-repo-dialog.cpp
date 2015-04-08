@@ -45,7 +45,7 @@ DownloadRepoDialog::DownloadRepoDialog(const Account& account,
     mRepoIcon->setPixmap(repo.getPixmap());
     mRepoName->setText(repo_.name);
 
-    mDirectory->setPlaceholderText(tr("Choose a folder"));
+    mDirectory->setPlaceholderText(tr("Sync this library to:"));
 
     if (repo_.encrypted) {
         mPassword->setVisible(true);
